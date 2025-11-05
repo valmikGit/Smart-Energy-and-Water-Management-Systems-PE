@@ -3,3 +3,6 @@ packet_features
 uniflow_features
 seawsenv
 outputs
+Smart_Water_Management_System/*
+!Smart_Water_Management_System/Blender_Python_Codes
+.idea
