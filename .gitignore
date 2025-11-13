@@ -7,3 +7,4 @@ Smart_Water_Management_System/*
 !Smart_Water_Management_System/Blender_Python_Codes
 !Smart_Water_Management_System/water_tank_simulator
 .idea
+*.csv
