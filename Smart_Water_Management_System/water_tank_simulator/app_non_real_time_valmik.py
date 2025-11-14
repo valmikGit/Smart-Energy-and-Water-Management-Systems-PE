@@ -112,9 +112,13 @@ def run_tank_simulation(tank_id: str, csv_path: str, delay_seconds: float):
 
 # ✅ EDIT THIS LIST to match your CSV files
 CSV_PATHS = [
-    "datasets/tank_alpha.csv",
-    "datasets/tank_beta.csv",
-    "datasets/sensor_readings.csv"
+    r"Smart_Water_Management_System\water_tank_simulator\data\Water_History_A1FD_2025-05-16_06-58.csv",
+    r"Smart_Water_Management_System\water_tank_simulator\data\Water_History_A1FD_2025-05-16_07-00.csv",
+    r"Smart_Water_Management_System\water_tank_simulator\data\Water_History_A1FF_2025-05-16_06-58.csv",
+    r"Smart_Water_Management_System\water_tank_simulator\data\Water_History_A1MD_2025-05-16_06-59.csv",
+    r"Smart_Water_Management_System\water_tank_simulator\data\Water_History_A2MFF_2025-05-16_07-00.csv",
+    r"Smart_Water_Management_System\water_tank_simulator\data\Water_History_BTTF_2025-05-16_07-01.csv"
+
 ]
 
 # =================================================================
