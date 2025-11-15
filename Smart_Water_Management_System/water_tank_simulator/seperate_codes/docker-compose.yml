@@ -35,4 +35,4 @@ services:
     depends_on:
       - backend
     ports:
-      - "8501:8501"
+      - "8502:8502"
