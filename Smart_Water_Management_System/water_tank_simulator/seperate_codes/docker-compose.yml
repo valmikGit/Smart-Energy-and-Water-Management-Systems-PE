@@ -1,0 +1,38 @@
+version: "3.8"
+services:
+  redis:
+    image: "redis:7.2-alpine"
+    container_name: sim_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: sim_backend
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - ./data:/app/data:ro
+    depends_on:
+      - redis
+    ports:
+      - "8000:8000"
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: sim_frontend
+    environment:
+      # When running in compose, make backend reachable by service name "backend"
+      - STREAMLIT_SERVER_ENABLECORS=false
+      - BACKEND_URL=http://backend:8000
+    volumes:
+      - ./data:/app/data:ro
+    depends_on:
+      - backend
+    ports:
+      - "8501:8501"
