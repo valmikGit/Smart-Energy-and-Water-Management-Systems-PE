@@ -28,7 +28,8 @@ except Exception:
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Configure relative CSVs (edit paths to actual CSV location)
+print(f"BASE DIRECTORY = {BASE_DIR}")
+
 CSV_FILENAMES = [
     "data/Water_History_A1FD_2025-05-16_06-58.csv",
     "data/Water_History_A1FD_2025-05-16_07-00.csv",
@@ -36,30 +37,22 @@ CSV_FILENAMES = [
     "data/Water_History_A1MD_2025-05-16_06-59.csv",
     "data/Water_History_A1MD_2025-05-16_07-00.csv",
     "data/Water_History_A2MFF_2025-05-16_07-00.csv",
-    "data/Water_History_BTTF_2025-05-16_07-01.csv",
+    "data/Water_History_BTTF_2025-05-16_07-01.csv"
 ]
 CSV_PATHS = [os.path.join(BASE_DIR, p) for p in CSV_FILENAMES]
 
 DEFAULT_DELAY_SECONDS = 1.0
 
-# In-memory structures
 EVENT_QUEUE: "Queue[Dict[str,Any]]" = Queue()
 LATEST_STATE: Dict[str, Dict[str, Any]] = {}
 LATEST_LOCK = threading.Lock()
-
-# Data store for preloaded CSVs
 DATA_STORE: Dict[str, Dict[str, Any]] = {}
-
-# Workers and control
 WORKER_EVENTS: Dict[str, threading.Event] = {}
 WORKER_THREADS: Dict[str, threading.Thread] = {}
-
-# For SSE/Websocket broadcasting (async)
 SUBSCRIBERS: List[asyncio.Queue] = []
 SUBSCRIBERS_LOCK = threading.Lock()
 ASYNC_LOOP: Optional[asyncio.AbstractEventLoop] = None
 
-# Redis settings (optional)
 REDIS_URL = os.environ.get("REDIS_URL", None)
 REDIS_CHANNEL = "tank_events"
 REDIS_LATEST_KEY = "tank_latest_state"
@@ -99,8 +92,11 @@ def _try_parse_datetime(s: str) -> Optional[datetime]:
         return None
 
 def preload_csv(csv_path: str) -> Tuple[Optional[List[datetime]], Optional[List[float]], Optional[float], Optional[float], Optional[float], str]:
+    print(f"[CSV LOAD] Attempting to load {csv_path}")
     if not os.path.exists(csv_path):
-        return None, None, None, None, None, f"File not found: {csv_path}"
+        err_msg = f"File not found: {csv_path}"
+        print(f"[CSV ERROR] {err_msg}")
+        return None, None, None, None, None, err_msg
     timestamps = []
     values = []
     try:
@@ -108,7 +104,9 @@ def preload_csv(csv_path: str) -> Tuple[Optional[List[datetime]], Optional[List[
             reader = csv.DictReader(fh)
             headers = reader.fieldnames or []
             if not headers:
-                return None, None, None, None, None, "CSV has no header row"
+                err_msg = "CSV has no header row"
+                print(f"[CSV ERROR] {csv_path}: {err_msg}")
+                return None, None, None, None, None, err_msg
             norm_map = {}
             for h in headers:
                 if h:
@@ -132,7 +130,9 @@ def preload_csv(csv_path: str) -> Tuple[Optional[List[datetime]], Optional[List[
                     if re.search(r"value|volume|level|consum|flow|reading", h, re.I):
                         value_key = h; break
             if not time_key or not value_key:
-                return None, None, None, None, None, f"Missing timestamp/value columns. Headers: {headers}"
+                err_msg = f"Missing timestamp/value columns. Headers: {headers}"
+                print(f"[CSV ERROR] {csv_path}: {err_msg}")
+                return None, None, None, None, None, err_msg
             for row in reader:
                 ts_raw = row.get(time_key, "")
                 v_raw = row.get(value_key, "")
@@ -152,14 +152,19 @@ def preload_csv(csv_path: str) -> Tuple[Optional[List[datetime]], Optional[List[
                 timestamps.append(ts)
                 values.append(v)
     except Exception as e:
-        return None, None, None, None, None, f"CSV read error: {e}"
+        err_msg = f"CSV read error: {e}"
+        print(f"[CSV ERROR] {csv_path}: {err_msg}")
+        return None, None, None, None, None, err_msg
     if not values:
-        return None, None, None, None, None, "No numeric rows found"
+        err_msg = "No numeric rows found"
+        print(f"[CSV ERROR] {csv_path}: {err_msg}")
+        return None, None, None, None, None, err_msg
     combined = sorted(zip(timestamps, values), key=lambda x: x[0])
     timestamps_sorted, values_sorted = zip(*combined)
     gmin = float(min(values_sorted))
     gmax = float(max(values_sorted))
     grange = float(gmax - gmin) if gmax != gmin else 1.0
+    print(f"[CSV LOAD SUCCESS] {csv_path}: {len(values_sorted)} rows loaded, range={gmin}-{gmax}")
     return list(timestamps_sorted), list(values_sorted), gmin, gmax, grange, ""
 
 # -------------------
@@ -170,6 +175,7 @@ def worker_loop(name: str, timestamps: List[datetime], values: List[float], gmin
     idx = 0
     with LATEST_LOCK:
         LATEST_STATE[name] = {"level": 0.0, "timestamp": "", "progress_step": 0, "total_updates": n, "status": "Running"}
+    print(f"[WORKER START] {name} ({n} updates, delay={delay_seconds}s)")
     while not stop_event.is_set():
         raw_val = values[idx]
         ts = timestamps[idx].strftime("%Y-%m-%d %H:%M:%S")
@@ -184,14 +190,12 @@ def worker_loop(name: str, timestamps: List[datetime], values: List[float], gmin
             "progress_step": idx + 1,
             "total_updates": n,
         }
-        # push to in-memory queue
         EVENT_QUEUE.put(event)
-        # publish to Redis if configured (synchronous publish), and set latest hash
+        print(f"[WORKER EVENT] {name} idx={idx} level={level_m3:.3f} m³ queue_size={EVENT_QUEUE.qsize()}")
         if REDIS_URL and REDIS_AVAILABLE:
             try:
                 r = redis.StrictRedis.from_url(REDIS_URL)
                 r.publish(REDIS_CHANNEL, json.dumps(event))
-                # set latest state as JSON string
                 r.hset(REDIS_LATEST_KEY, name, json.dumps({
                     "level": round(level_m3, 3),
                     "timestamp": ts,
@@ -199,9 +203,8 @@ def worker_loop(name: str, timestamps: List[datetime], values: List[float], gmin
                     "total_updates": n,
                     "status": "Running"
                 }))
-            except Exception:
-                pass
-        # update LATEST_STATE
+            except Exception as e:
+                print(f"[REDIS ERROR] {e}")
         with LATEST_LOCK:
             LATEST_STATE[name].update({
                 "level": round(level_m3, 3),
@@ -210,9 +213,7 @@ def worker_loop(name: str, timestamps: List[datetime], values: List[float], gmin
                 "total_updates": n,
                 "status": "Running",
             })
-        # broadcast to SSE/WS subscribers (async)
         if ASYNC_LOOP is not None:
-            # place into all subscriber queues
             with SUBSCRIBERS_LOCK:
                 for q in SUBSCRIBERS:
                     try:
@@ -226,28 +227,19 @@ def worker_loop(name: str, timestamps: List[datetime], values: List[float], gmin
     with LATEST_LOCK:
         if name in LATEST_STATE:
             LATEST_STATE[name]["status"] = "Stopped"
-
-# -------------------
-# Startup helpers for ASYNC loop
-# -------------------
-def start_background_forwarder(loop: asyncio.AbstractEventLoop):
-    # not used much here; kept for potential extension
-    pass
+    print(f"[WORKER STOP] {name}")
 
 # -------------------
 # API endpoints
 # -------------------
 @app.post("/start")
 async def start_simulation(req: Request):
-    """
-    Body (JSON): {"delay_seconds": 1.0, "csv_paths": ["optional list of paths relative to BASE_DIR"]}
-    """
     body = await req.json()
     delay_seconds = body.get("delay_seconds", DEFAULT_DELAY_SECONDS)
     csv_paths = body.get("csv_paths", None)
     paths = CSV_PATHS if not csv_paths else [os.path.join(BASE_DIR, p) for p in csv_paths]
 
-    # preload all CSVs
+    print(f"[START REQUEST] delay={delay_seconds}s, csv_paths={paths}")
     DATA_STORE.clear()
     errors = []
     for p in paths:
@@ -255,12 +247,13 @@ async def start_simulation(req: Request):
         ts, vals, gmin, gmax, grange, err = preload_csv(p)
         if err:
             errors.append(f"{name}: {err}")
+            print(f"[PRELOAD ERROR] {name}: {err}")
             continue
         DATA_STORE[name] = {"csv_path": p, "timestamps": ts, "values": vals, "gmin": gmin, "gmax": gmax, "grange": grange}
     if errors:
+        print(f"[START ERROR] {errors}")
         raise HTTPException(status_code=400, detail={"errors": errors})
 
-    # stop existing workers
     for ev in list(WORKER_EVENTS.values()):
         ev.set()
     for t in list(WORKER_THREADS.values()):
@@ -269,11 +262,9 @@ async def start_simulation(req: Request):
     WORKER_EVENTS.clear()
     WORKER_THREADS.clear()
 
-    # clear latest state (keep queue)
     with LATEST_LOCK:
         LATEST_STATE.clear()
 
-    # if Redis available, optionally clear latest key
     if REDIS_URL and REDIS_AVAILABLE:
         try:
             rcli = redis.StrictRedis.from_url(REDIS_URL)
@@ -281,18 +272,19 @@ async def start_simulation(req: Request):
         except Exception:
             pass
 
-    # start workers
     for name, info in DATA_STORE.items():
         ev = threading.Event()
         WORKER_EVENTS[name] = ev
         t = threading.Thread(target=worker_loop, args=(name, info["timestamps"], info["values"], info["gmin"], info["grange"], delay_seconds, ev), daemon=True)
         WORKER_THREADS[name] = t
         t.start()
+        print(f"[WORKER THREAD STARTED] {name}")
 
     return JSONResponse({"status": "started", "tanks": list(DATA_STORE.keys()), "delay_seconds": delay_seconds})
 
 @app.post("/stop")
 def stop_simulation():
+    print("[STOP REQUEST] Stopping all workers")
     for ev in list(WORKER_EVENTS.values()):
         ev.set()
     for t in list(WORKER_THREADS.values()):
@@ -311,11 +303,11 @@ def get_events(max_events: int = Query(200)):
             events.append(e)
         except Empty:
             break
+    print(f"[EVENTS REQUEST] Returning {len(events)} events, queue_size={EVENT_QUEUE.qsize()}")
     return {"events": events, "returned": len(events)}
 
 @app.get("/latest")
 def latest():
-    # Prefer Redis latest if available
     result = {}
     if REDIS_URL and REDIS_AVAILABLE:
         try:
@@ -332,6 +324,7 @@ def latest():
     if not result:
         with LATEST_LOCK:
             result = {k: v.copy() for k, v in LATEST_STATE.items()}
+    print(f"[LATEST REQUEST] {list(result.keys())}")
     return {"latest": result}
 
 @app.get("/status")
@@ -339,11 +332,14 @@ def status():
     with LATEST_LOCK:
         snapshot = {k: v.copy() for k, v in LATEST_STATE.items()}
     running = any(v.get("status") == "Running" for v in snapshot.values()) if snapshot else False
-    return {"running": running, "tanks": list(snapshot.keys()), "latest": snapshot, "queue_size": EVENT_QUEUE.qsize()}
+    queue_size = EVENT_QUEUE.qsize()
+    print(f"[STATUS REQUEST] running={running}, tanks={list(snapshot.keys())}, queue_size={queue_size}")
+    return {"running": running, "tanks": list(snapshot.keys()), "latest": snapshot, "queue_size": queue_size}
 
 @app.get("/list")
 def list_csvs():
     avail = [os.path.basename(p) for p in CSV_PATHS]
+    print(f"[LIST CSVS] Available: {avail}")
     return {"csv_paths": CSV_PATHS, "available": avail}
 
 @app.get("/health")
@@ -351,7 +347,7 @@ def health():
     return {"ok": True}
 
 # -------------------
-# SSE endpoint
+# SSE & WS endpoints (same as before)
 # -------------------
 from fastapi.responses import StreamingResponse
 
@@ -361,27 +357,18 @@ async def sse_event_generator(client_queue: asyncio.Queue):
             ev = await client_queue.get()
             if ev is None:
                 break
-            # SSE format: "data: <json>\n\n"
             yield f"data: {json.dumps(ev)}\n\n"
     except asyncio.CancelledError:
         return
 
 @app.get("/stream/sse")
 async def stream_sse():
-    """
-    Server-Sent Events endpoint. Creates a per-client asyncio.Queue, registers it, and returns a stream.
-    """
-    # create per-client queue
     q: asyncio.Queue = asyncio.Queue()
     with SUBSCRIBERS_LOCK:
         SUBSCRIBERS.append(q)
-    # Return streaming response
     response = StreamingResponse(sse_event_generator(q), media_type="text/event-stream")
     return response
 
-# -------------------
-# WebSocket endpoint
-# -------------------
 @app.websocket("/stream/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
@@ -402,19 +389,18 @@ async def websocket_endpoint(ws: WebSocket):
                 SUBSCRIBERS.remove(q)
 
 # -------------------
-# Lifespan: capture asyncio loop
+# Lifespan
 # -------------------
 @app.on_event("startup")
 async def startup_event():
     global ASYNC_LOOP
     ASYNC_LOOP = asyncio.get_event_loop()
-    # If Redis configured and available, optionally create an async subscriber to Redis channel and fan-out to SUBSCRIBERS
+    print("[STARTUP] Async loop captured")
     if REDIS_URL and REDIS_AVAILABLE:
         try:
             redis_client = aioredis.from_url(REDIS_URL)
             pubsub = redis_client.pubsub()
             await pubsub.subscribe(REDIS_CHANNEL)
-
             async def redis_listener():
                 async for message in pubsub.listen():
                     if message is None:
@@ -426,18 +412,16 @@ async def startup_event():
                         ev = json.loads(raw)
                     except Exception:
                         continue
-                    # fan out to internal subscribers
                     with SUBSCRIBERS_LOCK:
                         for q in SUBSCRIBERS:
                             await q.put(ev)
-
             asyncio.create_task(redis_listener())
         except Exception:
             pass
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    # close subscribers
+    print("[SHUTDOWN] Closing all subscribers")
     with SUBSCRIBERS_LOCK:
         for q in SUBSCRIBERS:
             try:
@@ -450,4 +434,5 @@ async def shutdown_event():
 # Run
 # -------------------
 if __name__ == "__main__":
+    print("[BACKEND STARTING] Uvicorn server")
     uvicorn.run("backend:app", host="0.0.0.0", port=8000, reload=False)

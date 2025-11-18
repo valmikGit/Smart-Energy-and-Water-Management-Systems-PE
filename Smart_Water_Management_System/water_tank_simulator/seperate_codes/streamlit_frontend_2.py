@@ -4,13 +4,15 @@ import requests
 import pandas as pd
 import plotly.graph_objects as go
 from streamlit_autorefresh import st_autorefresh
+import time
 
 # -------------------------
 # Configuration
 # -------------------------
 BACKEND_URL = "http://localhost:8000"
-POLL_INTERVAL_SEC = 1.0 
+POLL_INTERVAL_SEC = 0.2  # fast but safe polling for incremental updates
 MAX_HISTORY_LENGTH = 2000  # Limit per tank history
+MAX_CHART_POINTS = 500     # Limit points plotted for performance
 
 st.set_page_config(layout="wide", page_title="Tank Simulation Dashboard")
 st.title("💧 Tank Simulation Dashboard")
@@ -72,43 +74,61 @@ st.markdown("---")
 # -------------------------
 if "history" not in st.session_state:
     st.session_state.history = {}
-    print("[STATE] Initialized empty session state for history.")
+    st.session_state.chart_placeholders = {}
+    print("[STATE] Initialized session state for history and chart placeholders.")
 
 # -------------------------
-# Fetch latest tank snapshot
+# Fetch **one event at a time**
 # -------------------------
-latest = {}
 try:
-    latest_resp = requests.get(f"{BACKEND_URL}/latest", timeout=3).json()
-    latest = latest_resp.get("latest", {})
-    print(f"[FETCH] Latest snapshot fetched. Tanks: {list(latest.keys())}")
+    ev_resp = requests.get(
+        f"{BACKEND_URL}/events",
+        params={"max_events": 1},  # only fetch 1 event per poll
+        timeout=3
+    )
+    ev_resp.raise_for_status()
+    events = ev_resp.json().get("events", [])
+    print(f"[EVENTS] Fetched {len(events)} new event(s) from backend.")
 except Exception as e:
-    st.warning("Failed to fetch latest tank data from backend")
-    print(f"[ERROR] Failed to fetch latest snapshot: {e}")
+    events = []
+    print(f"[ERROR] Failed to fetch events: {e}")
 
 # -------------------------
 # Update session state history
 # -------------------------
-for name, state in latest.items():
-    ts = state.get("timestamp", "")
-    level = state.get("level", 0.0)
-    print(f"[UPDATE] Tank: {name}, Timestamp: {ts}, Level: {level:.3f} m³")
+for ev in events:
+    tid = ev.get("tank_id")
+    ts = ev.get("timestamp")
+    level = ev.get("level_m3", 0.0)
+    print(f"[UPDATE] Tank: {tid}, Timestamp: {ts}, Level: {level:.3f} m³")
 
-    if name not in st.session_state.history:
-        st.session_state.history[name] = []
-        print(f"[STATE] Created new history list for tank {name}")
+    if tid not in st.session_state.history:
+        st.session_state.history[tid] = []
+        print(f"[STATE] Created new history list for tank {tid}")
 
-    st.session_state.history[name].append((ts, level))
+    st.session_state.history[tid].append((ts, level))
+
     # Cap history length
-    if len(st.session_state.history[name]) > MAX_HISTORY_LENGTH:
-        st.session_state.history[name] = st.session_state.history[name][-MAX_HISTORY_LENGTH:]
-        print(f"[STATE] Trimmed history for {name} to {MAX_HISTORY_LENGTH} entries.")
+    if len(st.session_state.history[tid]) > MAX_HISTORY_LENGTH:
+        st.session_state.history[tid] = st.session_state.history[tid][-MAX_HISTORY_LENGTH:]
+        print(f"[STATE] Trimmed history for {tid} to {MAX_HISTORY_LENGTH} entries.")
+
+# -------------------------
+# Fetch latest snapshot for live tanks
+# -------------------------
+latest = {}
+try:
+    latest_resp = requests.get(f"{BACKEND_URL}/latest", timeout=2).json()
+    latest = latest_resp.get("latest", {})
+    print(f"[FETCH] Latest snapshot fetched. Tanks: {list(latest.keys())}")
+except Exception as e:
+    st.warning("Failed to fetch latest snapshot")
+    print(f"[ERROR] Failed to fetch latest snapshot: {e}")
 
 # -------------------------
 # Display live tanks
 # -------------------------
 st.subheader("Live Tanks")
-
 if not latest:
     st.info("No tanks available. Ensure backend workers are started.")
     print("[INFO] No tanks available to display.")
@@ -131,7 +151,6 @@ else:
             pct = min(100, max(0, level / 10.0 * 100))
             h = int(pct * 1.5)
 
-            # Tank visualization
             html = f'''
             <div style="height:150px;width:120px;border:2px solid #555;border-radius:6px;
                         position:relative;overflow:hidden;background:#f0f2f6;margin:auto;">
@@ -156,31 +175,29 @@ st.subheader("Real-time Charts (per-tank)")
 
 for name in sorted(st.session_state.history.keys()):
     hist = st.session_state.history[name]
-    print(f"[CHART] Rendering chart for {name}, {len(hist)} data points.")
-    if not hist:
-        continue
+    if name not in st.session_state.chart_placeholders:
+        st.session_state.chart_placeholders[name] = st.empty()
 
-    df = pd.DataFrame(hist, columns=["Timestamp", "Level"])
+    placeholder = st.session_state.chart_placeholders[name]
 
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=df["Timestamp"], y=df["Level"],
-                             mode="lines+markers", name=name))
-    fig.update_layout(title=name, xaxis_title="Timestamp", yaxis_title="Level (m³)", height=300)
-
-    st.plotly_chart(fig, width='stretch')
-    print(f"[CHART] Chart rendered for tank {name}")
+    if hist:
+        df = pd.DataFrame(hist[-MAX_CHART_POINTS:], columns=["Timestamp", "Level"])
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=df["Timestamp"], y=df["Level"], mode="lines+markers", name=name))
+        fig.update_layout(title=name, xaxis_title="Timestamp", yaxis_title="Level (m³)", height=300)
+        placeholder.plotly_chart(fig, width='stretch')
+        print(f"[CHART] Rendered chart for tank {name} ({len(df)} points)")
 
 # -------------------------
-# Display recent events (latest snapshot)
+# Display recent tank levels
 # -------------------------
 st.markdown("---")
 st.subheader("Recent Tank Levels")
-
 for name, state in sorted(latest.items()):
     ts = state.get('timestamp', '')
     level = state.get('level', 0.0)
     st.write(f"**{name}** — {ts} — level {level:.3f} m³")
     print(f"[RECENT] Tank: {name}, Timestamp: {ts}, Level: {level:.3f} m³")
 
-st.caption(f"Note: This Streamlit UI polls the backend every {POLL_INTERVAL_SEC} seconds and maintains history for charts.")
+st.caption(f"Note: This Streamlit UI polls the backend every {POLL_INTERVAL_SEC} seconds and updates **one event at a time**.")
 print("[INFO] Streamlit frontend update complete.\n")
