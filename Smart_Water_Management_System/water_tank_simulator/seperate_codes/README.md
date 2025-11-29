@@ -6,7 +6,7 @@ The system is built using a microservices architecture with **FastAPI** (Backend
 
 ---
 
-## 🏗️ Architecture
+## Architecture
 
 The application consists of three main components:
 
@@ -16,7 +16,7 @@ The application consists of three main components:
 
 ---
 
-## 🚀 Deployment with Docker
+## Deployment with Docker
 
 The easiest way to run the application is using Docker Compose.
 
@@ -42,7 +42,7 @@ The easiest way to run the application is using Docker Compose.
 
 ---
 
-## 🐍 Backend Details (`backend.py`)
+## Backend Details (`backend.py`)
 
 The backend is the core of the simulation, responsible for data processing and state management.
 
